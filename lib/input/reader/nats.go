@@ -20,22 +20,31 @@ import (
 
 //------------------------------------------------------------------------------
 
+// SubscriptionConfig contains the configuration structure for a NATS subcription
+type SubscritionConfig struct {
+	Subject string `json:"subject" yaml:"subject"`
+	QueueID string `json:"queue" yaml:"queue"`
+}
+
 // NATSConfig contains configuration fields for the NATS input type.
 type NATSConfig struct {
-	URLs          []string    `json:"urls" yaml:"urls"`
-	Subject       string      `json:"subject" yaml:"subject"`
-	QueueID       string      `json:"queue" yaml:"queue"`
-	PrefetchCount int         `json:"prefetch_count" yaml:"prefetch_count"`
-	TLS           btls.Config `json:"tls" yaml:"tls"`
-	Auth          auth.Config `json:"auth" yaml:"auth"`
+	URLs          []string            `json:"urls" yaml:"urls"`
+	Subscriptions []SubscritionConfig `json:"subscriptions" yaml:"subscriptions"`
+	PrefetchCount int                 `json:"prefetch_count" yaml:"prefetch_count"`
+	TLS           btls.Config         `json:"tls" yaml:"tls"`
+	Auth          auth.Config         `json:"auth" yaml:"auth"`
 }
 
 // NewNATSConfig creates a new NATSConfig with default values.
 func NewNATSConfig() NATSConfig {
 	return NATSConfig{
-		URLs:          []string{nats.DefaultURL},
-		Subject:       "benthos_messages",
-		QueueID:       "benthos_queue",
+		URLs: []string{nats.DefaultURL},
+		Subscriptions: []SubscritionConfig{
+			{
+				QueueID: "benthos_queue",
+				Subject: "benthos_messages",
+			},
+		},
 		PrefetchCount: 32,
 		TLS:           btls.NewConfig(),
 		Auth:          auth.New(),
@@ -54,7 +63,7 @@ type NATS struct {
 	cMut sync.Mutex
 
 	natsConn      *nats.Conn
-	natsSub       *nats.Subscription
+	natsSubs      []*nats.Subscription
 	natsChan      chan *nats.Msg
 	interruptChan chan struct{}
 	tlsConf       *tls.Config
@@ -99,7 +108,7 @@ func (n *NATS) ConnectWithContext(ctx context.Context) error {
 	}
 
 	var natsConn *nats.Conn
-	var natsSub *nats.Subscription
+	var natsSubs []*nats.Subscription
 	var err error
 	var opts []nats.Option
 
@@ -114,20 +123,28 @@ func (n *NATS) ConnectWithContext(ctx context.Context) error {
 	}
 	natsChan := make(chan *nats.Msg, n.conf.PrefetchCount)
 
-	if len(n.conf.QueueID) > 0 {
-		natsSub, err = natsConn.ChanQueueSubscribe(n.conf.Subject, n.conf.QueueID, natsChan)
-	} else {
-		natsSub, err = natsConn.ChanSubscribe(n.conf.Subject, natsChan)
-	}
+	for _, sub := range n.conf.Subscriptions {
+		var (
+			err     error
+			natsSub *nats.Subscription
+		)
 
-	if err != nil {
-		return err
-	}
+		if len(sub.QueueID) > 0 {
+			natsSub, err = natsConn.ChanQueueSubscribe(sub.Subject, sub.QueueID, natsChan)
+		} else {
+			natsSub, err = natsConn.ChanSubscribe(sub.Subject, natsChan)
+		}
 
-	n.log.Infof("Receiving NATS messages from subject: %v\n", n.conf.Subject)
+		if err != nil {
+			n.log.WithFields(map[string]string{"error": err.Error()}).Errorf("Error subscribing to subject %s\n", sub.Subject)
+			continue
+		}
+		natsSubs = append(natsSubs, natsSub)
+		n.log.Infof("Receiving NATS messages from subject: %s\n", sub.Subject)
+	}
 
 	n.natsConn = natsConn
-	n.natsSub = natsSub
+	n.natsSubs = natsSubs
 	n.natsChan = natsChan
 	return nil
 }
@@ -136,9 +153,8 @@ func (n *NATS) disconnect() {
 	n.cMut.Lock()
 	defer n.cMut.Unlock()
 
-	if n.natsSub != nil {
-		n.natsSub.Unsubscribe()
-		n.natsSub = nil
+	for _, sub := range n.natsSubs {
+		sub.Unsubscribe()
 	}
 	if n.natsConn != nil {
 		n.natsConn.Close()
@@ -151,6 +167,7 @@ func (n *NATS) disconnect() {
 func (n *NATS) ReadWithContext(ctx context.Context) (types.Message, AsyncAckFn, error) {
 	n.cMut.Lock()
 	natsChan := n.natsChan
+	natsConn := n.natsConn
 	n.cMut.Unlock()
 
 	var msg *nats.Msg
@@ -167,7 +184,15 @@ func (n *NATS) ReadWithContext(ctx context.Context) (types.Message, AsyncAckFn, 
 	}
 
 	bmsg := message.New([][]byte{msg.Data})
-	bmsg.Get(0).Metadata().Set("nats_subject", msg.Subject)
+	meta := bmsg.Get(0).Metadata()
+	meta.Set("nats_subject", msg.Subject)
+	// process message headers if server supports the feature
+	if natsConn.HeadersSupported() {
+		for key := range msg.Header {
+			value := msg.Header.Get(key)
+			meta.Set(key, value)
+		}
+	}
 
 	return bmsg, func(ctx context.Context, res types.Response) error {
 		if res.Error() != nil {

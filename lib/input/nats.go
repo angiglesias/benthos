@@ -37,8 +37,10 @@ You can access these metadata fields using
 				[]string{"nats://127.0.0.1:4222"},
 				[]string{"nats://username:password@127.0.0.1:4222"},
 			).Array(),
-			docs.FieldCommon("queue", "The queue to consume from."),
-			docs.FieldCommon("subject", "A subject to consume from."),
+			docs.FieldAdvanced("subscriptions", "nats subjects to subscribe client").WithChildren(
+				docs.FieldCommon("queue", "The queue to consume from."),
+				docs.FieldCommon("subject", "A subject to consume from."),
+			).Array(),
 			docs.FieldAdvanced("prefetch_count", "The maximum number of messages to pull at a time."),
 			tls.FieldSpec(),
 			auth.FieldSpec(),
