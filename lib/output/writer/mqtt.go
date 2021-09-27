@@ -3,6 +3,7 @@ package writer
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,20 +23,20 @@ import (
 
 // MQTTConfig contains configuration fields for the MQTT output type.
 type MQTTConfig struct {
-	URLs                  []string      `json:"urls" yaml:"urls"`
-	QoS                   uint8         `json:"qos" yaml:"qos"`
-	Retained              bool          `json:"retained" yaml:"retained"`
-	Topic                 string        `json:"topic" yaml:"topic"`
-	ClientID              string        `json:"client_id" yaml:"client_id"`
-	DynamicClientIDSuffix string        `json:"dynamic_client_id_suffix" yaml:"dynamic_client_id_suffix"`
-	Will                  mqttconf.Will `json:"will" yaml:"will"`
-	User                  string        `json:"user" yaml:"user"`
-	Password              string        `json:"password" yaml:"password"`
-	ConnectTimeout        string        `json:"connect_timeout" yaml:"connect_timeout"`
-	WriteTimeout          string        `json:"write_timeout" yaml:"write_timeout"`
-	KeepAlive             int64         `json:"keepalive" yaml:"keepalive"`
-	MaxInFlight           int           `json:"max_in_flight" yaml:"max_in_flight"`
-	TLS                   tls.Config    `json:"tls" yaml:"tls"`
+	URLs                  []string          `json:"urls" yaml:"urls"`
+	QoS                   uint8             `json:"qos" yaml:"qos"`
+	Retained              mqttconf.Retained `json:"retained" yaml:"retained"`
+	Topic                 string            `json:"topic" yaml:"topic"`
+	ClientID              string            `json:"client_id" yaml:"client_id"`
+	DynamicClientIDSuffix string            `json:"dynamic_client_id_suffix" yaml:"dynamic_client_id_suffix"`
+	Will                  mqttconf.Will     `json:"will" yaml:"will"`
+	User                  string            `json:"user" yaml:"user"`
+	Password              string            `json:"password" yaml:"password"`
+	ConnectTimeout        string            `json:"connect_timeout" yaml:"connect_timeout"`
+	WriteTimeout          string            `json:"write_timeout" yaml:"write_timeout"`
+	KeepAlive             int64             `json:"keepalive" yaml:"keepalive"`
+	MaxInFlight           int               `json:"max_in_flight" yaml:"max_in_flight"`
+	TLS                   tls.Config        `json:"tls" yaml:"tls"`
 }
 
 // NewMQTTConfig creates a new MQTTConfig with default values.
@@ -52,6 +53,7 @@ func NewMQTTConfig() MQTTConfig {
 		WriteTimeout:   "3s",
 		MaxInFlight:    1,
 		KeepAlive:      30,
+		Retained:       mqttconf.DefaultRetained(),
 		TLS:            tls.NewConfig(),
 	}
 }
@@ -66,9 +68,10 @@ type MQTT struct {
 	connectTimeout time.Duration
 	writeTimeout   time.Duration
 
-	urls  []string
-	conf  MQTTConfig
-	topic *field.Expression
+	urls     []string
+	conf     MQTTConfig
+	topic    *field.Expression
+	retained *field.Expression
 
 	client  mqtt.Client
 	connMut sync.RWMutex
@@ -108,6 +111,12 @@ func NewMQTTV2(
 
 	if m.topic, err = interop.NewBloblangField(mgr, conf.Topic); err != nil {
 		return nil, fmt.Errorf("failed to parse topic expression: %v", err)
+	}
+
+	if !conf.Retained.IsBool() {
+		if m.retained, err = interop.NewBloblangField(mgr, conf.Retained.StrVal()); err != nil {
+			return nil, fmt.Errorf("failed to parse retained expression: %v", err)
+		}
 	}
 
 	switch m.conf.DynamicClientIDSuffix {
@@ -218,7 +227,15 @@ func (m *MQTT) Write(msg types.Message) error {
 	}
 
 	return IterateBatchedSend(msg, func(i int, p types.Part) error {
-		mtok := client.Publish(m.topic.String(i, msg), m.conf.QoS, m.conf.Retained, p.Get())
+		retained := false
+		if m.retained != nil {
+			var parseErr error
+			retained, parseErr = strconv.ParseBool(m.retained.String(i, msg))
+			if parseErr != nil {
+				m.log.Errorf("Error parsing boolean value from retained flag: %v \n", parseErr)
+			}
+		}
+		mtok := client.Publish(m.topic.String(i, msg), m.conf.QoS, retained, p.Get())
 		mtok.Wait()
 		sendErr := mtok.Error()
 		if sendErr == mqtt.ErrNotConnected {
